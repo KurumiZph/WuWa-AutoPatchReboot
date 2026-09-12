@@ -12,6 +12,23 @@ It keeps restarting the game (will do it once, mostly) until it detects:
 
 Then it stops and leaves the game open.
 
+## Table of Contents
+
+- [Requirements](#requirements)
+- [Setup](#setup)
+  - [1. Clone this repository](#1-clone-this-repository)
+  - [2. Install Python](#2-install-python)
+  - [3. Install Tesseract OCR](#3-install-tesseract-ocr)
+  - [4. Install Python dependencies](#4-install-python-dependencies)
+  - [5. Configure](#5-configure)
+- [Run](#run)
+- [How It Works](#how-it-works)
+- [Troubleshooting](#troubleshooting)
+- [Limitations](#limitations)
+- [Disclaimer](#disclaimer)
+- [AI Assistance](#ai-assistance)
+- [License](#license)
+
 ## Requirements
 
 - Windows 10/11
@@ -21,7 +38,7 @@ Then it stops and leaves the game open.
 
 ## Setup
 
-### 1. Clone this repository:
+### 1. Clone this repository
 
 #### Install Git 
 
@@ -76,7 +93,7 @@ python -m pip install -r requirements.txt
 
 ### 5. Configure
 
-Edit  `WuWa-apr.py` and set:
+Edit  `wuwa-apr.py` and set:
 
 ```python
 GAME_EXE = r"C:\Path\To\Wuthering Waves.exe"
@@ -91,38 +108,7 @@ For Example:
 GAME_EXE = r"C:\Steam\steamapps\common\Wuthering Waves\Wuthering Waves.exe"
 ```
 
-### 6. Install Python packages
-
-In the project folder, run:
-
-```bash
-python -m pip install -r requirements.txt
-```
-
-### 7. Run
-
-Run:
-
-```bash
-python wuwa-apr.py
-```
-
-### Recommended: Create a shortcut for wuwa-apr.py and use it as your default Wuthering Waves launch shortcut.
-
-## How it works
-
-1. Starts Wuthering Waves.
-2. Finds the game window.
-3. Uses Tesseract OCR to read the game screen.
-4. Detects the patch restart message.
-5. Closes and restarts the game.
-6. Checks the screen again.
-7. Stops when Tap to land in Solaris-3 is detected.
-8. Leaves Wuthering Waves open.
-
-The script uses the actual game window instead of fixed screen coordinates, so different resolutions and monitors should work.
-
-## Additional Configuration
+#### Additional Configuration
 ```python
 # How long to wait before restarting Wuthering Waves after
 # the "Patching complete. Please restart the game" screen is detected.
@@ -140,6 +126,33 @@ LOGIN_CONFIRMATIONS_REQUIRED = 2
 # before the script closes and restarts the game.
 PATCH_CONFIRMATIONS_REQUIRED = 2
 ```
+
+## Run
+
+Use a terminal to run:
+
+```bash
+python wuwa-apr.py
+```
+
+or double click the script.
+
+### Recommended: Create a shortcut for wuwa-apr.py and use it as your default Wuthering Waves launch shortcut.
+
+## How it works
+
+1. Starts Wuthering Waves.
+2. Finds the game window.
+3. Uses Tesseract OCR to read the game screen.
+4. Detects the patch restart message.
+5. Closes and restarts the game.
+6. Checks the screen again.
+7. Stops when Tap to land in Solaris-3 is detected.
+8. Leaves Wuthering Waves open.
+
+The script uses the actual game window instead of fixed screen coordinates, so different resolutions and monitors should work.
+
+
 
 ## Troubleshooting
 
