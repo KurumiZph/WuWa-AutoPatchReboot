@@ -1,0 +1,60 @@
+[WuWa] Launching game...
+[WuWa] Waiting for game process...
+[WuWa] Game process detected.
+[WINDOW] Waiting for Wuthering Waves window...
+[WINDOW] Found WuWa window:
+          Title: Client
+          Size: 1936x1096
+
+============================================================
+[OCR] MONITORING STARTED
+============================================================
+
+[OCR] Looking for:
+       LOGIN  = tap to land in solaris 3
+       PATCH  = Patching complete / Please restart
+
+[OCR] Entire WuWa window is scanned.
+[OCR] Screen resolution does not need to be configured.
+
+[OCR] Press Ctrl+C to stop.
+
+[WINDOW] Waiting for Wuthering Waves window...
+[WINDOW] Found WuWa window:
+          Title: Wuthering Waves  
+          Size: 1920x1080
+[OCR] bb loc programs wis i ca hing rein wuwwa autopatchreboot bb administrator powershell7 fq wataing eae ae e sss a a be om a lll ree pe acm a bee re a aa a se i ae a ieee ee es ll
+[OCR] bb cscs sisi pda loc programs wis i ca hing rein bb sans rator powershell 7 bal fd waren ves ey es acm rion ee ee i
+[OCR] 
+[OCR] 4 kuro wal games g
+[OCR] photosensitive seizure warning when exposed to certain visual stimuli or flashing lights a very small percentage of people including those with epilepsy and some undiagnosed individuals may experience seizures with symptoms such as dizziness facial discoloration eye or face twitching foaming at the mouth confusion or loss of consciousness or uncontrollable muscle spasms if you your family or other household members experience similar symptoms please consult a doctor before playing the game if you experience any of the above symptoms while playing immediately stop playing seek medical attention as soon as possible and follow your doctor s advice access steam foalures from the overlay while playing press shift f2 to begin
+[OCR] 
+[OCR] eb ie ws sn y sa ws sy 4 ss ole sa milly ler cz x za ps lf ss sic eee oe
+[OCR] 4 a a j a eee
+[OCR] a vas it iv va 6b ld ss ss all oy sf ss i sale ss bog yo ze s is as nae ss se te a a
+[OCR] 05 indo product 3 60 6370088 notice i a it repai s wut hering ah aa we yp vy t fae fe css a al ze gz aia sf checking for app updates
+[OCR] arish welcome s product 3 6 0 8370988 3 6 15 8779263 az notice a al a wuthering oo waves yy abel wee ae i be deen login ease fa login success sy se ss bs ah vf ss se oe ae a ge i a sa analyzing patch resources
+[OCR] e arish welcome vs product 3 6 0 8370988 3 6 15 8779263 tf notice an va wuthering ya ie sal t ce atu ao login ti ee se ss ss cn pe ee bm analyzing patch resources
+[OCR] 4 a a bs aia
+[OCR] y a my a ss va dy ns s a ss 3 i mai ze s ss se we za 2a 3 ry
+[OCR] my it ss s yf a ss 7 we hi g aw 77 84 in s a em sss sp as as
+[OCR] te tn a ss fs a ss ss y ad ade ss ss pile ze za ss de ae es i gence
+[OCR] it ss ss ve a bp 7 ss jw ip os an ss ss sa za ie a 4
+[OCR] my gt ss iy sz roy ss v ec wh zz g ss i a aa ws an ff gp ss ss gal aa ss ae a a
+[OCR] 7 7 ee were a onl a
+[OCR] a a i wh re i 4 ww sn kx is de ye on py ss a zz x ds 072a ss a a ws al oa se if 2 a ze 4 sa z ax a aa a a
+[OCR] he he wi a wuthering w indo 5 0 15 8779 uh ww ae so ie z ll ws y ve i a we ei ore le seq on sa le tools ne s ex 2 se k a ha ae eal ae 407 a ccount sm see y 7 za ae zig zz pa sea a tap to land in solaris 3 login status 0
+[LOGIN] Possible detection 1/2 | score=1.00 | text='tap to land in solaris 3'
+[OCR] hi indo 15 87792 ans od ez aad ss a via a he si es pe bu le sq le at a po tools ne s sz ae x er ss hl ee eg e ss as account re ee a nc om a 4 sea tap to land in solaris 3 login status 0
+[LOGIN] Possible detection 2/2 | score=1.00 | text='tap to land in solaris 3'
+
+============================================================
+[SUCCESS] LOGIN SCREEN CONFIRMED
+============================================================
+
+Detected:
+    tap to land in solaris 3
+
+Wuthering Waves will remain running.
+The watchdog is exiting.
+

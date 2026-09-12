@@ -1,5 +1,6 @@
 import os
 import re
+import ctypes
 import sys
 import time
 import subprocess
@@ -16,7 +17,24 @@ import win32gui
 import win32process
 import win32con
 
+def is_admin():
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except Exception:
+        return False
 
+
+if not is_admin():
+    ctypes.windll.shell32.ShellExecuteW(
+        None,
+        "runas",
+        sys.executable,
+        " ".join(f'"{arg}"' for arg in sys.argv),
+        None,
+        1,
+    )
+    sys.exit()
+    
 # ============================================================
 # WUTHERING WAVES OCR WATCHDOG
 # ============================================================
