@@ -9,6 +9,9 @@ import difflib
 import importlib
 import atexit
 import winreg
+import threading
+import json
+import queue
 from pathlib import Path
 
 # ---------------- AUTO-INSTALL DEPENDENCIES ----------------
@@ -22,26 +25,99 @@ REQUIRED_PACKAGES = {
     "pytesseract": "pytesseract>=0.3.13",
     "psutil": "psutil>=6.0.0",
     "win32gui": "pywin32>=306",
+    "pystray": "pystray>=0.19.5",
 }
 
 
-def ensure_dependencies():
-    missing = []
-    for module_name, pip_spec in REQUIRED_PACKAGES.items():
-        try:
-            importlib.import_module(module_name)
-        except ImportError:
-            missing.append(pip_spec)
+def _module_importable(module_name):
+    try:
+        importlib.import_module(module_name)
+        return True
+    except ImportError:
+        return False
 
-    if not missing:
+
+def _run_pywin32_postinstall():
+    """
+    pywin32 needs an extra post-install step (copying its runtime DLLs
+    into place) that a plain `pip install pywin32` never runs on its
+    own. Without it, `import win32gui` (and similar) fails with
+    ModuleNotFoundError even though pip reports a successful install.
+    """
+    scripts_dir = os.path.join(os.path.dirname(sys.executable), "Scripts")
+    postinstall_script = os.path.join(scripts_dir, "pywin32_postinstall.py")
+
+    if not os.path.isfile(postinstall_script):
+        return False
+
+    try:
+        print("[SETUP] Running pywin32 post-install step...")
+        subprocess.check_call([sys.executable, postinstall_script, "-install"])
+        return True
+    except Exception as e:
+        try:
+            print(f"[SETUP] pywin32 post-install step failed: {e}")
+        except Exception:
+            pass
+        return False
+
+
+def ensure_dependencies():
+    # A frozen PyInstaller exe already has every dependency bundled
+    # inside it -- there's no system Python or pip to call, and
+    # sys.executable is the exe itself, not a real interpreter. Only
+    # relevant when running the raw .py with a normal Python install.
+    if getattr(sys, "frozen", False):
         return
 
-    print(f"[SETUP] Installing missing packages: {', '.join(missing)}")
+    missing_modules = []
+    missing_specs = []
+    for module_name, pip_spec in REQUIRED_PACKAGES.items():
+        if not _module_importable(module_name):
+            missing_modules.append(module_name)
+            missing_specs.append(pip_spec)
+
+    if not missing_specs:
+        return
+
     try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
+        print(f"[SETUP] Installing missing packages: {', '.join(missing_specs)}")
+    except Exception:
+        pass
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", *missing_specs])
     except subprocess.CalledProcessError as e:
-        print(f"[SETUP] Failed to install dependencies: {e}")
-        input("\nPress Enter to exit...")
+        try:
+            print(f"[SETUP] Failed to install dependencies: {e}")
+        except Exception:
+            pass
+        try:
+            input("\nPress Enter to exit...")
+        except Exception:
+            pass
+        sys.exit(1)
+
+    if "win32gui" in missing_modules:
+        _run_pywin32_postinstall()
+
+    # pywin32 in particular can still need the postinstall step above
+    # before its modules are actually importable -- verify instead of
+    # letting the real `import win32gui` further down crash with a
+    # bare traceback.
+    still_missing = [m for m in missing_modules if not _module_importable(m)]
+    if still_missing:
+        try:
+            print(f"[SETUP] Still missing after install: {', '.join(still_missing)}")
+            if "win32gui" in still_missing:
+                print("Try running these manually, then re-run this script:")
+                print(f'  "{sys.executable}" -m pip install --force-reinstall pywin32')
+                print(f'  "{sys.executable}" Scripts\\pywin32_postinstall.py -install')
+        except Exception:
+            pass
+        try:
+            input("\nPress Enter to exit...")
+        except Exception:
+            pass
         sys.exit(1)
 
 
@@ -51,9 +127,10 @@ import pytesseract
 import psutil
 import webbrowser
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, filedialog
+import pystray
 
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
 
 import win32gui
 import win32process
@@ -83,7 +160,7 @@ if not is_admin():
 
 # ---------------- CONFIG ----------------
 
-GAME_EXE = r"E:\SteamLibrary\steamapps\common\Wuthering Waves\Wuhering Waves.exe"
+GAME_EXE = r"E:\SteamLibrary\steamapps\common\Wuthering Waves\Wuthering Waves.exe"
 TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 TESSERACT_DOWNLOAD_URL = "https://github.com/UB-Mannheim/tesseract/wiki"
 
@@ -117,10 +194,79 @@ LOGIN_TARGET = "tap to land in solaris 3"
 PATCH_TARGETS = ["patching complete", "please restart the game"]
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-LOG_FILE = SCRIPT_DIR / "ocr_log.txt"
-DEBUG_SCREENSHOT = SCRIPT_DIR / "ocr_debug.png"
+
+
+def get_app_dir():
+    """
+    Where to keep files that must persist across runs (log, debug
+    screenshot, saved config). Deliberately NOT next to the exe/script:
+    someone might run this from their Desktop, a USB drive, or a
+    read-only Program Files folder, and could easily rename, move, or
+    delete a sibling file without realizing it matters. Windows' own
+    per-user AppData\\Roaming is the standard, stable place for this --
+    it survives the exe being moved, renamed, or reinstalled entirely.
+    """
+    appdata = os.environ.get("APPDATA") or os.path.expanduser("~")
+    app_dir = os.path.join(appdata, "WuWaWatchdog")
+    os.makedirs(app_dir, exist_ok=True)
+    return app_dir
+
+
+APP_DIR = get_app_dir()
+LOG_FILE = Path(APP_DIR) / "ocr_log.txt"
+DEBUG_SCREENSHOT = Path(APP_DIR) / "ocr_debug.png"
+CONFIG_FILE = Path(APP_DIR) / "wuwa_watchdog_config.json"
+
+# Optional: drop a PNG next to the script (or bundle it into the exe with
+# PyInstaller's --add-data) to use a custom tray icon. Falls back to a
+# generated placeholder if it isn't there.
+TRAY_ICON_FILENAME = "icon.png"
+
+
+def resource_path(filename):
+    """Resolve a bundled READ-ONLY resource (like the tray icon), whether
+    run from source or frozen (where bundled data lands in sys._MEIPASS).
+    Don't use this for anything the app needs to write -- see get_app_dir()."""
+    base = getattr(sys, "_MEIPASS", str(SCRIPT_DIR))
+    return os.path.join(base, filename)
+
+
+def load_config():
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_config(data):
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        log(f"[CONFIG] Could not save config: {e}")
+
 
 pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+
+
+# ---------------- SHARED STATE (tray + watchdog thread) ----------------
+
+stop_event = threading.Event()   # set by the tray "Quit" action
+_tray_icon = None                # the pystray.Icon, once created
+_status_text = "Starting..."     # shown in the tray's status menu item
+
+
+def set_status(text, also_log=True):
+    global _status_text
+    _status_text = text
+    if also_log:
+        log(text)
+    if _tray_icon is not None:
+        try:
+            _tray_icon.title = f"WuWa Watchdog: {text}"
+        except Exception:
+            pass
 
 
 # ---------------- LOGGING ----------------
@@ -154,14 +300,29 @@ def _close_log_handle():
 atexit.register(_close_log_handle)
 
 
+_log_queue = queue.Queue()  # feeds the live log viewer window
+
+
 def log(message):
-    print(message)
+    try:
+        print(message)
+    except Exception:
+        pass  # no console when frozen as a windowed/tray exe
     handle = _get_log_handle()
     if handle:
         try:
             handle.write(message + "\n")
         except Exception:
             pass
+    _log_queue.put(message)
+
+
+def safe_print(*args, **kwargs):
+    """print() that can't crash a console-less frozen exe."""
+    try:
+        print(*args, **kwargs)
+    except Exception:
+        pass
 
 
 # ---------------- TEXT NORMALIZATION ----------------
@@ -555,16 +716,211 @@ def find_steam_library_folders():
     return libraries
 
 
+def _find_exe_in(base_dir, exe_names, max_depth=3):
+    """Bounded search under base_dir for any of exe_names (avoids
+    walking an entire drive if a folder turns out to be huge)."""
+    if not base_dir or not os.path.isdir(base_dir):
+        return None
+
+    base_depth = base_dir.rstrip(os.sep).count(os.sep)
+    for root, dirs, files in os.walk(base_dir):
+        depth = root.rstrip(os.sep).count(os.sep) - base_depth
+        if depth >= max_depth:
+            dirs[:] = []  # don't descend further from here
+        for name in exe_names:
+            if name in files:
+                return os.path.join(root, name)
+
+    return None
+
+
+def find_game_exe_via_registry(exe_names):
+    """
+    Non-Steam installs (the official launcher from wutheringwaves.com)
+    still register themselves in Windows' installed-programs list, with
+    an InstallLocation pointing at the game folder. Check that.
+    """
+    uninstall_keys = [
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+    ]
+
+    for hive, subkey in uninstall_keys:
+        try:
+            with winreg.OpenKey(hive, subkey) as key:
+                for i in range(winreg.QueryInfoKey(key)[0]):
+                    try:
+                        entry_name = winreg.EnumKey(key, i)
+                        with winreg.OpenKey(key, entry_name) as entry:
+                            display_name = winreg.QueryValueEx(entry, "DisplayName")[0]
+                            if "wuthering waves" not in display_name.lower():
+                                continue
+                            install_location = winreg.QueryValueEx(entry, "InstallLocation")[0]
+                            found = _find_exe_in(install_location, exe_names)
+                            if found:
+                                return found
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+
+    return None
+
+
+def find_game_exe_common_locations(exe_names):
+    """Last-ditch guess: check a few typical default install folder
+    names on every fixed drive letter, for non-Steam installs that
+    didn't register properly or got moved by hand."""
+    folder_names = [
+        "Wuthering Waves",
+        os.path.join("Wuthering Waves", "Wuthering Waves Game"),
+        os.path.join("Games", "Wuthering Waves"),
+        os.path.join("Program Files", "Wuthering Waves"),
+    ]
+
+    drive_bits = ctypes.windll.kernel32.GetLogicalDrives()
+    drives = [f"{chr(65 + i)}:\\" for i in range(26) if drive_bits & (1 << i)]
+
+    for drive in drives:
+        for folder in folder_names:
+            found = _find_exe_in(os.path.join(drive, folder), exe_names, max_depth=2)
+            if found:
+                return found
+
+    return None
+
+
 def find_game_exe_auto():
-    """Scan every Steam library for the WuWa install folder."""
+    """
+    Best-effort search, in order: Steam libraries, then Windows'
+    installed-programs registry (covers the standalone/non-Steam
+    launcher), then a handful of common default install folders.
+    """
     exe_names = ["Wuthering Waves.exe", "Client-Win64-Shipping.exe"]
 
     for library in find_steam_library_folders():
-        base = os.path.join(library, "steamapps", "common", "Wuthering Waves")
-        for name in exe_names:
-            candidate = os.path.join(base, name)
-            if os.path.isfile(candidate):
-                return candidate
+        found = _find_exe_in(
+            os.path.join(library, "steamapps", "common", "Wuthering Waves"),
+            exe_names,
+        )
+        if found:
+            return found
+
+    found = find_game_exe_via_registry(exe_names)
+    if found:
+        return found
+
+    return find_game_exe_common_locations(exe_names)
+
+
+EXPECTED_EXE_NAMES = ["Wuthering Waves.exe", "Client-Win64-Shipping.exe", "WutheringWaves.exe"]
+
+
+def prompt_browse_for_game_exe():
+    """Last resort when nothing was auto-detected: ask the user to
+    browse for the exe by hand. The game's install folder usually has
+    several .exe files (launcher, crash reporter, the real client), so
+    this is explicit about which one to pick and sanity-checks the
+    result instead of silently accepting whatever they clicked."""
+    messagebox.showinfo(
+        "WuWa Watchdog",
+        "Could not find Wuthering Waves automatically.\n\n"
+        "In the next window, browse into the game's install folder and "
+        "select its MAIN executable -- usually named:\n\n"
+        "    Wuthering Waves.exe\n\n"
+        "(or, if you go into a \"Binaries\" subfolder, "
+        "Client-Win64-Shipping.exe)\n\n"
+        "Do NOT pick a launcher, updater, or crash-reporter exe -- those "
+        "usually sit one folder up or have \"Launcher\"/\"CrashReport\" "
+        "in the name.\n\n"
+        "A typical path looks like:\n"
+        "...\\Wuthering Waves\\Wuthering Waves Game\\Wuthering Waves.exe",
+    )
+
+    root = tk.Tk()
+    root.withdraw()
+
+    while True:
+        path = filedialog.askopenfilename(
+            title="Select Wuthering Waves' MAIN game executable",
+            filetypes=[("Executable", "*.exe"), ("All files", "*.*")],
+        )
+
+        if not path or not os.path.isfile(path):
+            root.destroy()
+            return None
+
+        if os.path.basename(path) in EXPECTED_EXE_NAMES:
+            root.destroy()
+            return path
+
+        # Picked something, but the filename doesn't match what we'd
+        # expect -- could still be right (renamed install, odd setup),
+        # so warn instead of silently rejecting it.
+        use_anyway = messagebox.askyesno(
+            "WuWa Watchdog",
+            f'"{os.path.basename(path)}" doesn\'t match the usual game '
+            f"exe names ({', '.join(EXPECTED_EXE_NAMES)}).\n\n"
+            "It might be a launcher or another tool instead of the "
+            "actual game client.\n\n"
+            "Use it anyway?",
+        )
+        if use_anyway:
+            root.destroy()
+            return path
+        # else: loop back and let them browse again
+
+
+def resolve_game_exe():
+    """
+    Figures out which game exe to use, in priority order:
+      1. A path remembered in config.json from any previous run
+      2. The hardcoded GAME_EXE default in this script
+      3. Auto-detection (Steam, registry, common folders)
+      4. Asking the user to browse for it
+    Whichever one succeeds gets saved to config.json, so future runs
+    skip straight to step 1 (this also skips re-scanning every drive
+    letter on every single launch once it's found the game once).
+    Returns the resolved path, or None if the user gave up.
+
+    Testing hooks (env vars, both no-op unless set to "1"):
+      WUWA_TEST_NO_CONFIG      - ignore any remembered config.json path
+      WUWA_TEST_NO_AUTODETECT  - skip hardcoded/Steam/registry/common-folder
+                                  detection entirely, forcing the browse dialog
+    Lets you exercise the fallback dialogs on a machine where everything
+    is already correctly set up, without touching real files.
+    """
+    config = load_config()
+
+    if os.environ.get("WUWA_TEST_NO_CONFIG") != "1":
+        remembered = config.get("game_exe")
+        if remembered and os.path.isfile(remembered):
+            return remembered
+    else:
+        config = {}
+
+    if os.environ.get("WUWA_TEST_NO_AUTODETECT") != "1":
+        if os.path.isfile(GAME_EXE):
+            config["game_exe"] = GAME_EXE
+            save_config(config)
+            return GAME_EXE
+
+        auto_path = find_game_exe_auto()
+        if auto_path:
+            log(f"[SYSTEM] Auto-detected game exe: {auto_path}")
+            config["game_exe"] = auto_path
+            save_config(config)
+            return auto_path
+    else:
+        log("[TEST] WUWA_TEST_NO_AUTODETECT=1 -- skipping straight to browse dialog.")
+
+    browsed = prompt_browse_for_game_exe()
+    if browsed:
+        log(f"[SYSTEM] User-selected game exe: {browsed}")
+        config["game_exe"] = browsed
+        save_config(config)
+        return browsed
 
     return None
 
@@ -602,9 +958,11 @@ def wait_for_window_after_launch():
 def restart_countdown():
     log(f"\n[WuWa] Waiting {RESTART_WAIT_SECONDS} seconds before restarting...")
     for remaining in range(RESTART_WAIT_SECONDS, 0, -1):
-        print(f"\r[WuWa] Restarting in {remaining:3d} seconds...", end="", flush=True)
+        if stop_event.is_set():
+            return
+        safe_print(f"\r[WuWa] Restarting in {remaining:3d} seconds...", end="", flush=True)
         time.sleep(1)
-    print()
+    safe_print()
 
 
 # ---------------- MAIN OCR LOOP ----------------
@@ -615,6 +973,10 @@ def monitor_game():
     scan_number = 0
 
     while True:
+        if stop_event.is_set():
+            log("[WuWa] Watchdog stopped by user (tray quit).")
+            return
+
         # Re-find the window each loop since restarts change the HWND.
         window = find_best_game_window()
         if not window:
@@ -668,6 +1030,7 @@ def monitor_game():
             log(f"\nDetected:\n    {login['candidate']}\n")
             log("Wuthering Waves will remain running.")
             log("The watchdog is exiting.\n")
+            set_status("Login detected - watchdog finished.", also_log=False)
             return
 
         if patch_count >= PATCH_CONFIRMATIONS_REQUIRED:
@@ -675,6 +1038,7 @@ def monitor_game():
             log("[PATCH] RESTART MESSAGE CONFIRMED")
             log("=" * 60)
             log(f"\nDetected: {patch['candidate']}\n")
+            set_status("Patch detected - restarting game...", also_log=False)
 
             login_count = 0
             patch_count = 0
@@ -682,13 +1046,19 @@ def monitor_game():
             close_game()
             restart_countdown()
 
+            if stop_event.is_set():
+                log("[WuWa] Watchdog stopped by user (tray quit).")
+                return
+
             if launch_game():
                 log("[WuWa] Restart launched.")
                 new_window = wait_for_window_after_launch()
                 log("[WuWa] New game window detected." if new_window
                     else "[WuWa] WARNING: Game window was not found yet.")
+                set_status("Monitoring for login/patch screen...", also_log=False)
             else:
                 log("[WuWa] Restart failed.")
+                set_status("Restart failed - see log.", also_log=False)
                 return
 
             continue
@@ -696,9 +1066,15 @@ def monitor_game():
         time.sleep(CHECK_INTERVAL_SECONDS)
 
 
-# ---------------- MAIN ----------------
-
 # ---------------- TESSERACT CHECK ----------------
+
+def _tesseract_present():
+    """Wrapped so WUWA_TEST_NO_TESSERACT=1 can force this path to run
+    for testing, without touching the real Tesseract install."""
+    if os.environ.get("WUWA_TEST_NO_TESSERACT") == "1":
+        return False
+    return os.path.isfile(TESSERACT_PATH)
+
 
 def ensure_tesseract_installed():
     """
@@ -706,13 +1082,13 @@ def ensure_tesseract_installed():
     download page. Tesseract is a real .exe, not a pip package, so this
     can't auto-install it -- just point the user at the installer.
     """
-    if os.path.isfile(TESSERACT_PATH):
+    if _tesseract_present():
         return True
 
     root = tk.Tk()
     root.withdraw()
 
-    while not os.path.isfile(TESSERACT_PATH):
+    while not _tesseract_present():
         wants_download = messagebox.askyesno(
             "Tesseract-OCR Not Found",
             "This script needs Tesseract-OCR, which isn't installed "
@@ -741,10 +1117,167 @@ def ensure_tesseract_installed():
     return True
 
 
+# ---------------- SYSTEM TRAY ----------------
+
+# The live log viewer runs on its own dedicated thread with its own Tk
+# root, kept alive for the whole app lifetime. It's separate from both
+# the watchdog thread and pystray's main-thread event loop -- Tkinter
+# widgets can only safely be touched from the thread that owns them, so
+# this thread does nothing except drain _log_queue into a Text widget.
+
+_log_viewer_show_event = threading.Event()
+_log_viewer_root = None
+_log_viewer_text = None
+
+
+def _log_viewer_poll():
+    updated = False
+    while True:
+        try:
+            line = _log_queue.get_nowait()
+        except queue.Empty:
+            break
+        _log_viewer_text.insert(tk.END, line + "\n")
+        updated = True
+
+    if updated:
+        _log_viewer_text.see(tk.END)
+
+    if _log_viewer_show_event.is_set():
+        _log_viewer_show_event.clear()
+        _log_viewer_root.deiconify()
+        _log_viewer_root.lift()
+
+    _log_viewer_root.after(200, _log_viewer_poll)
+
+
+def run_log_viewer():
+    global _log_viewer_root, _log_viewer_text
+
+    root = tk.Tk()
+    root.title("WuWa Watchdog - Live Log")
+    root.geometry("820x480")
+    # Closing the window just hides it -- "Quit" in the tray is what
+    # actually ends the app, not the log window's [X] button.
+    root.protocol("WM_DELETE_WINDOW", root.withdraw)
+
+    text = tk.Text(root, wrap="word", bg="#111318", fg="#ddd", insertbackground="#ddd")
+    scrollbar = tk.Scrollbar(root, command=text.yview)
+    text.configure(yscrollcommand=scrollbar.set)
+    scrollbar.pack(side="right", fill="y")
+    text.pack(side="left", fill="both", expand=True)
+
+    _log_viewer_root = root
+    _log_viewer_text = text
+    root.withdraw()  # starts hidden; tray's "Show Log" reveals it
+
+    root.after(200, _log_viewer_poll)
+    root.mainloop()
+
+
+def build_tray_image():
+    """Load a bundled tray icon if present, else generate a placeholder."""
+    icon_path = resource_path(TRAY_ICON_FILENAME)
+    if os.path.isfile(icon_path):
+        try:
+            return Image.open(icon_path)
+        except Exception:
+            pass
+
+    image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    draw.ellipse((2, 2, 62, 62), fill=(60, 110, 220, 255))
+    draw.text((22, 20), "W", fill=(255, 255, 255, 255))
+    return image
+
+
+def on_show_log(icon, item):
+    _log_viewer_show_event.set()
+
+
+def on_show_debug_screenshot(icon, item):
+    if not DEBUG_SCREENSHOT.exists():
+        messagebox.showinfo("WuWa Watchdog", "No debug screenshot saved yet.")
+        return
+    try:
+        os.startfile(str(DEBUG_SCREENSHOT))
+    except Exception as e:
+        log(f"[TRAY] Could not open debug screenshot: {e}")
+
+
+def on_open_data_folder(icon, item):
+    try:
+        os.startfile(APP_DIR)
+    except Exception as e:
+        log(f"[TRAY] Could not open data folder: {e}")
+
+
+def on_quit(icon, item):
+    set_status("Stopping (quit requested)...")
+    stop_event.set()
+    icon.stop()
+
+
+def build_tray_menu():
+    return pystray.Menu(
+        pystray.MenuItem(lambda item: _status_text, None, enabled=False),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Show Live Log", on_show_log),
+        pystray.MenuItem("Show Debug Screenshot", on_show_debug_screenshot),
+        pystray.MenuItem("Open Data Folder", on_open_data_folder),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Quit", on_quit),
+    )
+
+
+def run_watchdog(icon):
+    """
+    Runs on a background thread (spawned by pystray) once the tray icon
+    is visible. Launches/watches the game; the main thread just hosts
+    the tray's event loop via icon.run().
+    """
+    global _tray_icon
+    _tray_icon = icon
+    icon.visible = True
+
+    try:
+        if is_game_running():
+            set_status("Game already running.")
+        elif not launch_game():
+            set_status("Failed to launch game - see log.")
+            return
+
+        set_status("Waiting for game window...")
+        window = wait_for_window_after_launch()
+        if not window:
+            set_status("Game window not found - see log.")
+            log("The game may still be starting.")
+            return
+
+        log("\n" + "=" * 60)
+        log("[OCR] MONITORING STARTED")
+        log("=" * 60)
+        log("\n[OCR] Looking for:")
+        log(f"       LOGIN  = {LOGIN_TARGET}")
+        log("       PATCH  = Patching complete / Please restart")
+        log("\n[OCR] Entire WuWa window is scanned.\n")
+
+        set_status("Monitoring for login/patch screen...")
+        monitor_game()
+
+    except Exception as e:
+        log(f"\n[FATAL ERROR] {e}")
+        log("The game has NOT been intentionally closed.")
+        set_status("Fatal error - see log.")
+
+    finally:
+        icon.stop()
+
+
 def main():
-    print("\n" + "=" * 60)
-    print("       WUTHERING WAVES OCR WATCHDOG")
-    print("=" * 60 + "\n")
+    safe_print("\n" + "=" * 60)
+    safe_print("       WUTHERING WAVES OCR WATCHDOG")
+    safe_print("=" * 60 + "\n")
 
     # Must run before any log() call: log() now keeps the file open for
     # the whole session, and Windows can't delete a file that's open.
@@ -754,56 +1287,36 @@ def main():
         pass
 
     if not ensure_tesseract_installed():
-        print("[ERROR] Tesseract-OCR is required. Exiting.")
-        input("\nPress Enter to exit...")
+        log("[ERROR] Tesseract-OCR is required. Exiting.")
+        messagebox.showerror("WuWa Watchdog", "Tesseract-OCR is required. Exiting.")
         return
     log("[SYSTEM] Tesseract found.")
 
     global GAME_EXE
-    if not os.path.isfile(GAME_EXE):
-        auto_path = find_game_exe_auto()
-        if auto_path:
-            log(f"[SYSTEM] Configured GAME_EXE not found, auto-detected via Steam: {auto_path}")
-            GAME_EXE = auto_path
-        else:
-            print(f"\n[ERROR] Wuthering Waves executable not found:\n{GAME_EXE}")
-            print("\nCould not auto-detect it via Steam either.")
-            print("Edit GAME_EXE at the top of WuWa.py.")
-            input("\nPress Enter to exit...")
-            return
-    log("[SYSTEM] Game executable found.")
-
-    if is_game_running():
-        log("[WuWa] Game is already running.")
-    elif not launch_game():
-        input("\nPress Enter to exit...")
+    resolved = resolve_game_exe()
+    if not resolved:
+        log("[ERROR] No Wuthering Waves executable was selected. Exiting.")
+        messagebox.showerror("WuWa Watchdog", "No Wuthering Waves executable was selected. Exiting.")
         return
+    GAME_EXE = resolved
+    log(f"[SYSTEM] Using game executable: {GAME_EXE}")
 
-    window = wait_for_window_after_launch()
-    if not window:
-        log("\n[ERROR] Could not find WuWa window.")
-        log("The game may still be starting.")
-        input("\nPress Enter to exit...")
-        return
+    # From here on there's no console interaction -- everything runs
+    # through the tray icon, its menu, the live log window, and the log
+    # file. The log viewer gets its own thread/Tk mainloop so it can
+    # stay open the whole session without blocking the tray.
+    threading.Thread(target=run_log_viewer, daemon=True).start()
 
-    log("\n" + "=" * 60)
-    log("[OCR] MONITORING STARTED")
-    log("=" * 60)
-    log("\n[OCR] Looking for:")
-    log(f"       LOGIN  = {LOGIN_TARGET}")
-    log("       PATCH  = Patching complete / Please restart")
-    log("\n[OCR] Entire WuWa window is scanned.")
-    log("[OCR] Screen resolution does not need to be configured.")
-    log("\n[OCR] Press Ctrl+C to stop.\n")
-
-    try:
-        monitor_game()
-    except KeyboardInterrupt:
-        print("\n")
-        log("[SYSTEM] Watchdog stopped by user.")
-    except Exception as e:
-        log(f"\n[FATAL ERROR] {e}")
-        log("The game has NOT been intentionally closed.")
+    icon = pystray.Icon(
+        "wuwa_watchdog",
+        build_tray_image(),
+        "WuWa Watchdog: Starting...",
+        menu=build_tray_menu(),
+    )
+    # setup() is called by pystray in its own background thread once the
+    # tray icon is visible, while icon.run() blocks this (main) thread
+    # running the tray's own event loop -- standard pystray pattern.
+    icon.run(setup=run_watchdog)
 
 
 if __name__ == "__main__":

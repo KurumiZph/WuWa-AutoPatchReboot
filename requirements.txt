@@ -2,3 +2,4 @@ Pillow>=11.0.0
 pytesseract>=0.3.13
 psutil>=6.0.0
 pywin32>=306
+pystray>=0.19.5
