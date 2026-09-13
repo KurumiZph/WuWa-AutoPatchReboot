@@ -152,8 +152,6 @@ or double click the script.
 
 The script uses the actual game window instead of fixed screen coordinates, so different resolutions and monitors should work.
 
-
-
 ## Troubleshooting
 
 If detection isn't working, enable:
@@ -177,9 +175,11 @@ These can help determine what Tesseract is reading.
 
 This project relies on OCR and the current Wuthering Waves UI.
 
-Future game updates may change the text, launcher behavior, window behavior, or UI and may require changes to the script.
+Future game updates may change the text or UI.
 
 OCR accuracy can also vary depending on resolution, display scaling, and the game UI.
+
+The script does not work with game minimized.
 
 ## Disclaimer
 

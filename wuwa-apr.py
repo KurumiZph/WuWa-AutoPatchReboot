@@ -1,21 +1,65 @@
 import os
 import re
 import ctypes
+from ctypes import wintypes
 import sys
 import time
 import subprocess
 import difflib
+import importlib
+import atexit
+import winreg
 from pathlib import Path
 
-import mss
+# ---------------- AUTO-INSTALL DEPENDENCIES ----------------
+# Checks for required packages and pip-installs anything missing,
+# so users don't have to run `pip install -r requirements.txt` by hand.
+# NOTE: this only covers Python packages. Tesseract-OCR itself is a
+# separate .exe and can't be installed this way -- see TESSERACT_PATH.
+
+REQUIRED_PACKAGES = {
+    "PIL": "Pillow>=11.0.0",
+    "pytesseract": "pytesseract>=0.3.13",
+    "psutil": "psutil>=6.0.0",
+    "win32gui": "pywin32>=306",
+}
+
+
+def ensure_dependencies():
+    missing = []
+    for module_name, pip_spec in REQUIRED_PACKAGES.items():
+        try:
+            importlib.import_module(module_name)
+        except ImportError:
+            missing.append(pip_spec)
+
+    if not missing:
+        return
+
+    print(f"[SETUP] Installing missing packages: {', '.join(missing)}")
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
+    except subprocess.CalledProcessError as e:
+        print(f"[SETUP] Failed to install dependencies: {e}")
+        input("\nPress Enter to exit...")
+        sys.exit(1)
+
+
+ensure_dependencies()
+
 import pytesseract
 import psutil
+import webbrowser
+import tkinter as tk
+from tkinter import messagebox
 
 from PIL import Image, ImageEnhance, ImageFilter
 
 import win32gui
 import win32process
 import win32con
+import win32ui
+
 
 def is_admin():
     try:
@@ -26,170 +70,42 @@ def is_admin():
 
 if not is_admin():
     ctypes.windll.shell32.ShellExecuteW(
-        None,
-        "runas",
-        sys.executable,
-        " ".join(f'"{arg}"' for arg in sys.argv),
-        None,
-        1,
+        None, "runas", sys.executable,
+        " ".join(f'"{arg}"' for arg in sys.argv), None, 1,
     )
     sys.exit()
-    
+
 # ============================================================
 # WUTHERING WAVES OCR WATCHDOG
-# ============================================================
-#
-# What this program does:
-#
-#   1. Starts Wuthering Waves.
-#   2. Finds the actual WuWa window.
-#   3. Captures the ENTIRE game window.
-#   4. OCRs the whole window.
-#   5. Looks for:
-#
-#       LOGIN:
-#       "Tap to land in Solaris-3"
-#
-#       PATCH RESTART:
-#       "Patching complete"
-#       "Please restart the game"
-#
-#   6. Requires multiple consecutive detections to avoid
-#      false positives.
-#
-#   7. LOGIN detected:
-#          Exit this script.
-#          Leave WuWa running.
-#
-#   8. PATCH detected:
-#          Close WuWa.
-#          Wait.
-#          Start WuWa again.
-#
-#
-# The script does NOT use fixed screen coordinates for detection.
+# Launches WuWa, OCRs the window, detects login/patch screens,
+# and auto-restarts the game on patch-complete. No fixed coords.
 # ============================================================
 
+# ---------------- CONFIG ----------------
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-# ------------------------------------------------------------
-# WUTHERING WAVES EXECUTABLE
-# ------------------------------------------------------------
-#
-# CHANGE THIS TO YOUR ACTUAL GAME EXE.
-#
-# Example:
-#
-# GAME_EXE = r"E:\SteamLibrary\steamapps\common\Wuthering Waves\Wuthering Waves.exe"
-#
-# ------------------------------------------------------------
-
-GAME_EXE = r"E:\SteamLibrary\steamapps\common\Wuthering Waves\Wuthering Waves.exe"
-
-
-# ------------------------------------------------------------
-# TESSERACT
-# ------------------------------------------------------------
-#
-# Change this if Tesseract is installed elsewhere.
-# ------------------------------------------------------------
-
+GAME_EXE = r"E:\SteamLibrary\steamapps\common\Wuthering Waves\Wuhering Waves.exe"
 TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+TESSERACT_DOWNLOAD_URL = "https://github.com/UB-Mannheim/tesseract/wiki"
 
+RESTART_WAIT_SECONDS = 15          # wait after "please restart" before relaunch
+CHECK_INTERVAL_SECONDS = 1.0       # seconds between OCR scans
 
-# ------------------------------------------------------------
-# RESTART DELAY
-# ------------------------------------------------------------
-#
-# How many seconds to wait after:
-#
-# "Patching complete. Please restart the game."
-#
-# ------------------------------------------------------------
-
-RESTART_WAIT_SECONDS = 15
-
-
-# ------------------------------------------------------------
-# OCR INTERVAL
-# ------------------------------------------------------------
-
-CHECK_INTERVAL_SECONDS = 1.0
-
-
-# ------------------------------------------------------------
-# DETECTION CONFIRMATION
-# ------------------------------------------------------------
-#
-# The text must be detected this many consecutive times before
-# the watchdog acts.
-#
-# This protects against one bad OCR frame.
-# ------------------------------------------------------------
-
-LOGIN_CONFIRMATIONS_REQUIRED = 2
+LOGIN_CONFIRMATIONS_REQUIRED = 2   # consecutive hits needed to confirm
 PATCH_CONFIRMATIONS_REQUIRED = 2
 
-
-# ------------------------------------------------------------
-# FUZZY MATCH THRESHOLD
-# ------------------------------------------------------------
-#
-# 1.00 = exact match
-#
-# Lower values tolerate more OCR mistakes.
-#
-# 0.70 - 0.80 is generally useful for OCR.
-# ------------------------------------------------------------
-
-LOGIN_MATCH_THRESHOLD = 0.72
-
+LOGIN_MATCH_THRESHOLD = 0.72       # fuzzy-match thresholds (1.0 = exact)
 PATCH_MATCH_THRESHOLD = 0.68
 
+# Restart popup must appear within this fraction of screen width/height
+# (0.0 = left/top edge, 1.0 = right/bottom edge) to count as real, so
+# corner text (like the version watermark) can't trigger a false restart.
+PATCH_CENTER_X_RANGE = (0.15, 0.85)
+PATCH_CENTER_Y_RANGE = (0.20, 0.80)
 
-# ------------------------------------------------------------
-# OCR IMAGE SIZE
-# ------------------------------------------------------------
-#
-# At 4K, OCRing the entire image can be unnecessarily slow.
-#
-# The screenshot is automatically resized so its longest side
-# is no larger than this value.
-#
-# This DOES NOT affect detection coordinates because OCR
-# coordinates are only used internally.
-# ------------------------------------------------------------
+MAX_OCR_DIMENSION = 2200           # downscale cap so OCR stays fast at 4K
 
-MAX_OCR_DIMENSION = 2200
-
-
-# ------------------------------------------------------------
-# DEBUG
-# ------------------------------------------------------------
-#
-# True:
-#   Prints OCR information to ocr_log.txt.
-#
-# False:
-#   Less logging.
-#
-# Keep True initially so we can diagnose anything unusual.
-# ------------------------------------------------------------
-
-DEBUG = True
-
-
-# ------------------------------------------------------------
-# GAME PROCESS NAMES
-# ------------------------------------------------------------
-#
-# WuWa may use different process names depending on version.
-#
-# Add another one here if necessary.
-# ------------------------------------------------------------
+DEBUG = True                       # verbose logging + debug screenshot
+DEBUG_SCREENSHOT_EVERY_N = 3       # save debug PNG every Nth scan (perf)
 
 GAME_PROCESS_NAMES = {
     "Wuthering Waves.exe",
@@ -197,1388 +113,698 @@ GAME_PROCESS_NAMES = {
     "WutheringWaves.exe",
 }
 
-
-# ============================================================
-# EXPECTED TEXT
-# ============================================================
-
 LOGIN_TARGET = "tap to land in solaris 3"
-
-PATCH_TARGETS = [
-    "patching complete",
-    "please restart the game",
-]
-
-
-# ============================================================
-# PATHS
-# ============================================================
+PATCH_TARGETS = ["patching complete", "please restart the game"]
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-
 LOG_FILE = SCRIPT_DIR / "ocr_log.txt"
-
 DEBUG_SCREENSHOT = SCRIPT_DIR / "ocr_debug.png"
-
-
-# ============================================================
-# TESSERACT SETUP
-# ============================================================
 
 pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
 
 
-# ============================================================
-# LOGGING
-# ============================================================
+# ---------------- LOGGING ----------------
+# Keeps one file handle open for the whole run instead of reopening
+# ocr_log.txt on every single log() call (matters a lot in DEBUG mode,
+# which logs every OCR word on every scan).
+
+_log_handle = None
+
+
+def _get_log_handle():
+    global _log_handle
+    if _log_handle is None:
+        try:
+            _log_handle = open(LOG_FILE, "a", encoding="utf-8", buffering=1)
+        except Exception:
+            _log_handle = False  # sentinel: open failed, don't retry every call
+    return _log_handle
+
+
+def _close_log_handle():
+    global _log_handle
+    if _log_handle:
+        try:
+            _log_handle.close()
+        except Exception:
+            pass
+        _log_handle = None
+
+
+atexit.register(_close_log_handle)
+
 
 def log(message):
-
     print(message)
-
-    try:
-
-        with open(
-            LOG_FILE,
-            "a",
-            encoding="utf-8"
-        ) as file:
-
-            file.write(message + "\n")
-
-    except Exception:
-        pass
+    handle = _get_log_handle()
+    if handle:
+        try:
+            handle.write(message + "\n")
+        except Exception:
+            pass
 
 
-# ============================================================
-# TEXT NORMALIZATION
-# ============================================================
+# ---------------- TEXT NORMALIZATION ----------------
 
 def normalize_text(text):
-    """
-    Normalize OCR text.
-
-    Examples:
-
-        "Tap to land in Solaris-3"
-            ->
-        "tap to land in solaris 3"
-
-        "Patching complete."
-            ->
-        "patching complete"
-    """
-
-    text = text.lower()
-
-    # Normalize common OCR punctuation.
-    text = text.replace("-", " ")
-    text = text.replace("_", " ")
-    text = text.replace("–", " ")
-    text = text.replace("—", " ")
-
-    # Keep letters/numbers/spaces only.
-    text = re.sub(
-        r"[^a-z0-9\s]",
-        " ",
-        text
-    )
-
-    # Collapse whitespace.
-    text = re.sub(
-        r"\s+",
-        " ",
-        text
-    )
-
+    """Lowercase, strip punctuation, collapse whitespace."""
+    text = text.lower().replace("-", " ").replace("_", " ").replace("–", " ").replace("—", " ")
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    text = re.sub(r"\s+", " ", text)
     return text.strip()
 
 
-# ============================================================
-# GAME PROCESS DETECTION
-# ============================================================
+# ---------------- GAME PROCESS DETECTION ----------------
 
 def get_game_processes():
-
     processes = []
-
-    for process in psutil.process_iter(
-        ["pid", "name"]
-    ):
-
+    for process in psutil.process_iter(["pid", "name"]):
         try:
-
-            name = process.info["name"]
-
-            if name in GAME_PROCESS_NAMES:
-
+            if process.info["name"] in GAME_PROCESS_NAMES:
                 processes.append(process)
-
-        except (
-            psutil.NoSuchProcess,
-            psutil.AccessDenied
-        ):
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
-
     return processes
 
 
 def is_game_running():
-
-    return len(
-        get_game_processes()
-    ) > 0
+    return len(get_game_processes()) > 0
 
 
-# ============================================================
-# FIND WINDOWS BELONGING TO WUWA
-# ============================================================
+# ---------------- FIND GAME WINDOWS ----------------
 
 def find_game_windows():
-    """
-    Find visible top-level Windows windows belonging to
-    a Wuthering Waves process.
-
-    No resolution assumptions are made here.
-    """
-
-    game_pids = {
-        process.pid
-        for process in get_game_processes()
-    }
-
+    """Find visible top-level windows belonging to a WuWa process."""
+    game_pids = {p.pid for p in get_game_processes()}
     windows = []
 
     def enum_callback(hwnd, extra):
-
         if not win32gui.IsWindowVisible(hwnd):
             return True
-
-        # Ignore tiny/invisible windows.
         try:
-
-            left, top, right, bottom = (
-                win32gui.GetWindowRect(hwnd)
-            )
-
-            width = right - left
-            height = bottom - top
-
+            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+            width, height = right - left, bottom - top
             if width < 500 or height < 300:
                 return True
-
         except Exception:
-
             return True
-
         try:
-
-            _, pid = win32process.GetWindowThreadProcessId(
-                hwnd
-            )
-
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
             if pid not in game_pids:
                 return True
-
         except Exception:
-
             return True
 
-        title = win32gui.GetWindowText(hwnd)
-
         windows.append({
-            "hwnd": hwnd,
-            "pid": pid,
-            "title": title,
-            "rect": (
-                left,
-                top,
-                right,
-                bottom
-            ),
-            "width": width,
-            "height": height,
+            "hwnd": hwnd, "pid": pid, "title": win32gui.GetWindowText(hwnd),
+            "rect": (left, top, right, bottom), "width": width, "height": height,
         })
-
         return True
 
     try:
-
-        win32gui.EnumWindows(
-            enum_callback,
-            None
-        )
-
+        win32gui.EnumWindows(enum_callback, None)
     except Exception as e:
-
-        log(
-            f"[WINDOW] EnumWindows error: {e}"
-        )
+        log(f"[WINDOW] EnumWindows error: {e}")
 
     return windows
 
 
 def find_best_game_window():
-
     windows = find_game_windows()
-
     if not windows:
         return None
-
-    # Prefer the largest WuWa window.
-    windows.sort(
-        key=lambda w: (
-            w["width"] * w["height"]
-        ),
-        reverse=True
-    )
-
+    windows.sort(key=lambda w: w["width"] * w["height"], reverse=True)
     return windows[0]
 
 
-# ============================================================
-# WAIT FOR GAME WINDOW
-# ============================================================
-
 def wait_for_game_window(timeout=60):
-
-    log(
-        "[WINDOW] Waiting for Wuthering Waves window..."
-    )
-
+    log("[WINDOW] Waiting for Wuthering Waves window...")
     start = time.time()
-
     while True:
-
         window = find_best_game_window()
-
         if window:
-
-            log(
-                "[WINDOW] Found WuWa window:"
-            )
-
-            log(
-                f"          Title: {window['title']}"
-            )
-
-            log(
-                f"          Size: "
-                f"{window['width']}x{window['height']}"
-            )
-
+            log("[WINDOW] Found WuWa window:")
+            log(f"          Title: {window['title']}")
+            log(f"          Size: {window['width']}x{window['height']}")
             return window
-
-        if (
-            timeout is not None
-            and
-            time.time() - start > timeout
-        ):
-
+        if timeout is not None and time.time() - start > timeout:
             return None
-
         time.sleep(1)
 
 
-# ============================================================
-# SCREEN CAPTURE
-# ============================================================
+# ---------------- WINDOW CAPTURE ----------------
 
-def capture_game_window(
-    sct,
-    window
-):
+def capture_game_window(window):
     """
-    Capture the actual WuWa window rectangle.
-
-    This means another application window elsewhere on the
-    desktop doesn't matter.
-
-    The watchdog console can therefore be minimized or moved
-    around without changing OCR coordinates.
+    Capture only the WuWa window via PrintWindow (PW_RENDERFULLCONTENT),
+    so GPU-rendered frames come through instead of a black bitmap.
     """
+    hwnd = window["hwnd"]
+    if not win32gui.IsWindow(hwnd):
+        return None
 
-    left, top, right, bottom = window["rect"]
-
-    width = right - left
-    height = bottom - top
-
+    left, top, right, bottom = win32gui.GetClientRect(hwnd)
+    width, height = right - left, bottom - top
     if width <= 0 or height <= 0:
         return None
 
-    screenshot = sct.grab({
-        "left": left,
-        "top": top,
-        "width": width,
-        "height": height,
-    })
-
-    image = Image.frombytes(
-        "RGB",
-        screenshot.size,
-        screenshot.rgb
-    )
-
-    return image
-
-
-# ============================================================
-# OCR PREPROCESSING
-# ============================================================
-
-def prepare_for_ocr(image):
-    """
-    Prepare screenshot for Tesseract.
-
-    Automatically scales based on image size.
-
-    This is resolution-independent.
-    """
-
-    image = image.convert("L")
-
-    width, height = image.size
-
-    largest_dimension = max(
-        width,
-        height
-    )
-
-    if largest_dimension > MAX_OCR_DIMENSION:
-
-        scale = (
-            MAX_OCR_DIMENSION /
-            largest_dimension
-        )
-
-        new_size = (
-            max(1, int(width * scale)),
-            max(1, int(height * scale))
-        )
-
-        image = image.resize(
-            new_size,
-            Image.Resampling.LANCZOS
-        )
-
-    # Increase contrast.
-    image = ImageEnhance.Contrast(
-        image
-    ).enhance(2.2)
-
-    # Sharpen text.
-    image = image.filter(
-        ImageFilter.SHARPEN
-    )
-
-    return image
-
-
-# ============================================================
-# OCR
-# ============================================================
-
-def perform_ocr(image):
-
-    processed = prepare_for_ocr(
-        image
-    )
-
+    hwnd_dc = src_dc = mem_dc = bitmap = None
     try:
+        hwnd_dc = win32gui.GetWindowDC(hwnd)
+        if not hwnd_dc:
+            return None
 
-        data = pytesseract.image_to_data(
-            processed,
-            lang="eng",
-            config="--oem 1 --psm 11",
-            output_type=pytesseract.Output.DICT
+        src_dc = win32ui.CreateDCFromHandle(hwnd_dc)
+        mem_dc = src_dc.CreateCompatibleDC()
+
+        bitmap = win32ui.CreateBitmap()
+        bitmap.CreateCompatibleBitmap(src_dc, width, height)
+        mem_dc.SelectObject(bitmap)
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        print_window = user32.PrintWindow
+        print_window.restype = wintypes.BOOL
+        print_window.argtypes = [wintypes.HWND, wintypes.HDC, wintypes.UINT]
+
+        result = print_window(
+            wintypes.HWND(int(hwnd)),
+            wintypes.HDC(int(mem_dc.GetSafeHdc())),
+            2,  # PW_RENDERFULLCONTENT
         )
+
+        if not result:
+            log(f"[CAPTURE] PrintWindow failed (error={ctypes.get_last_error()}).")
+            return None
+
+        info = bitmap.GetInfo()
+        bits = bitmap.GetBitmapBits(True)
+        image = Image.frombuffer(
+            "RGB", (info["bmWidth"], info["bmHeight"]), bits, "raw", "BGRX", 0, 1
+        )
+        return image.copy()
 
     except Exception as e:
+        log(f"[CAPTURE] Window capture error: {e}")
+        return None
 
-        log(
-            f"[OCR ERROR] {e}"
+    finally:
+        try:
+            if mem_dc is not None:
+                mem_dc.DeleteDC()
+        except Exception:
+            pass
+        try:
+            if src_dc is not None:
+                src_dc.DeleteDC()
+        except Exception:
+            pass
+        try:
+            if hwnd_dc is not None:
+                win32gui.ReleaseDC(hwnd, hwnd_dc)
+        except Exception:
+            pass
+        try:
+            if bitmap is not None:
+                win32gui.DeleteObject(bitmap.GetSafeHandle())
+        except Exception:
+            pass
+
+
+def prepare_for_ocr(image):
+    """Grayscale + downscale + contrast/sharpen for Tesseract."""
+    image = image.convert("L")
+    width, height = image.size
+    largest = max(width, height)
+
+    if largest > MAX_OCR_DIMENSION:
+        scale = MAX_OCR_DIMENSION / largest
+        new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+        # BILINEAR: faster than LANCZOS, plenty sharp enough for OCR
+        image = image.resize(new_size, Image.Resampling.BILINEAR)
+
+    image = ImageEnhance.Contrast(image).enhance(2.2)
+    image = image.filter(ImageFilter.SHARPEN)
+    return image
+
+
+# ---------------- OCR ----------------
+
+def perform_ocr(image):
+    processed = prepare_for_ocr(image)
+
+    try:
+        data = pytesseract.image_to_data(
+            processed, lang="eng", config="--oem 1 --psm 11",
+            output_type=pytesseract.Output.DICT,
         )
-
-        return {
-            "text": "",
-            "words": [],
-            "image": processed,
-        }
+    except Exception as e:
+        log(f"[OCR ERROR] {e}")
+        return {"text": "", "words": [], "image": processed}
 
     words = []
-
-    total_entries = len(
-        data["text"]
-    )
-
-    for i in range(total_entries):
-
+    for i in range(len(data["text"])):
         raw_text = data["text"][i].strip()
-
         if not raw_text:
             continue
-
         try:
-
-            confidence = float(
-                data["conf"][i]
-            )
-
+            confidence = float(data["conf"][i])
         except Exception:
-
             confidence = 0
-
-        # Ignore extremely low confidence garbage.
-        if confidence < 10:
+        if confidence < 10:  # drop low-confidence garbage
             continue
-
-        word = normalize_text(
-            raw_text
-        )
-
+        word = normalize_text(raw_text)
         if not word:
             continue
-
         words.append({
-            "text": word,
-            "confidence": confidence,
-            "left": data["left"][i],
-            "top": data["top"][i],
-            "width": data["width"][i],
-            "height": data["height"][i],
+            "text": word, "confidence": confidence,
+            "left": data["left"][i], "top": data["top"][i],
+            "width": data["width"][i], "height": data["height"][i],
         })
 
-    combined_text = " ".join(
-        word["text"]
-        for word in words
-    )
-
-    return {
-        "text": combined_text,
-        "words": words,
-        "image": processed,
-    }
+    combined_text = " ".join(w["text"] for w in words)
+    return {"text": combined_text, "words": words, "image": processed}
 
 
-# ============================================================
-# FUZZY TEXT MATCHING
-# ============================================================
+# ---------------- FUZZY TEXT MATCHING ----------------
 
 def similarity(a, b):
-
-    return difflib.SequenceMatcher(
-        None,
-        a,
-        b
-    ).ratio()
+    return difflib.SequenceMatcher(None, a, b).ratio()
 
 
-def find_fuzzy_phrase(
-    words,
-    target,
-    threshold
-):
-    """
-    Search OCR words for a phrase.
-
-    It doesn't require an exact match.
-
-    Example:
-
-        Expected:
-            tap to land in solaris 3
-
-        OCR:
-            tap to land in solaris ?
-
-    can still be accepted.
-    """
-
-    target = normalize_text(
-        target
-    )
-
+def find_fuzzy_phrase(words, target, threshold):
+    """Slide a window over OCR words looking for a fuzzy match to target."""
+    target = normalize_text(target)
     target_words = target.split()
-
     if not target_words:
         return None
 
-    target_count = len(
-        target_words
-    )
-
-    # Search windows slightly larger/smaller than target.
-    for window_size in range(
-        max(1, target_count - 1),
-        target_count + 3
-    ):
-
-        for start in range(
-            0,
-            len(words) - window_size + 1
-        ):
-
-            window = words[
-                start:
-                start + window_size
-            ]
-
-            candidate = " ".join(
-                word["text"]
-                for word in window
-            )
-
-            score = similarity(
-                target,
-                candidate
-            )
-
+    target_count = len(target_words)
+    for window_size in range(max(1, target_count - 1), target_count + 3):
+        for start in range(0, len(words) - window_size + 1):
+            window = words[start:start + window_size]
+            candidate = " ".join(w["text"] for w in window)
+            score = similarity(target, candidate)
             if score >= threshold:
-
-                return {
-                    "score": score,
-                    "candidate": candidate,
-                    "words": window,
-                }
+                return {"score": score, "candidate": candidate, "words": window}
 
     return None
 
 
-# ============================================================
-# LOGIN DETECTION
-# ============================================================
+# ---------------- DETECTION ----------------
 
 def detect_login(ocr):
-
-    words = ocr["words"]
-
-    result = find_fuzzy_phrase(
-        words,
-        LOGIN_TARGET,
-        LOGIN_MATCH_THRESHOLD
-    )
-
+    result = find_fuzzy_phrase(ocr["words"], LOGIN_TARGET, LOGIN_MATCH_THRESHOLD)
     if not result:
         return None
 
-    # --------------------------------------------------------
-    # Position is NOT required for detection.
-    #
-    # We only use it as a confidence boost / sanity check.
-    #
-    # This means resolution changes do not break detection.
-    # --------------------------------------------------------
-
+    # Position isn't required, just a confidence boost (login text sits low).
     matched_words = result["words"]
+    avg_top = sum(w["top"] for w in matched_words) / len(matched_words)
+    relative_y = avg_top / max(1, ocr["image"].height)
+    bottom_position = relative_y >= 0.65
 
-    avg_top = sum(
-        word["top"]
-        for word in matched_words
-    ) / len(matched_words)
+    score = min(result["score"] + (0.05 if bottom_position else 0), 1.0)
+    return {"score": score, "candidate": result["candidate"], "bottom_position": bottom_position}
 
-    image_height = ocr["image"].height
-
-    relative_y = (
-        avg_top /
-        max(1, image_height)
-    )
-
-    # Login text normally appears toward the bottom.
-    # Give extra confidence if that's where it is.
-    bottom_position = (
-        relative_y >= 0.65
-    )
-
-    confidence_score = result["score"]
-
-    if bottom_position:
-
-        confidence_score += 0.05
-
-    return {
-        "score": min(
-            confidence_score,
-            1.0
-        ),
-        "candidate": result["candidate"],
-        "bottom_position": bottom_position,
-    }
-
-
-# ============================================================
-# PATCH DETECTION
-# ============================================================
 
 def detect_patch(ocr):
-
+    """
+    Require BOTH "patching complete" and "please restart the game" to be
+    present (not just one), AND require them to sit roughly centered on
+    screen -- like the actual restart popup does. This avoids false
+    positives from things like the permanent bottom-corner version text,
+    which only ever shows "patching complete" on its own.
+    """
     words = ocr["words"]
 
-    results = []
-
-    # --------------------------------------------------------
-    # Look for:
-    #
-    #   Patching complete
-    #
-    # and:
-    #
-    #   Please restart the game
-    #
-    # --------------------------------------------------------
-
+    matches = []
     for target in PATCH_TARGETS:
+        result = find_fuzzy_phrase(words, target, PATCH_MATCH_THRESHOLD)
+        if not result:
+            return None  # all targets must be found, not just one
+        matches.append(result)
 
-        result = find_fuzzy_phrase(
-            words,
-            target,
-            PATCH_MATCH_THRESHOLD
-        )
-
-        if result:
-
-            results.append({
-                "target": target,
-                "score": result["score"],
-                "candidate": result["candidate"],
-                "words": result["words"],
-            })
-
-    # --------------------------------------------------------
-    # Strong detection:
-    #
-    # If OCR sees "patching", "complete" and "restart"
-    # somewhere in the game window, that's enough to strongly
-    # suggest the restart popup.
-    # --------------------------------------------------------
-
-    all_text = ocr["text"]
-
-    has_patching = (
-        "patching" in all_text
-    )
-
-    has_complete = (
-        "complete" in all_text
-    )
-
-    has_restart = (
-        "restart" in all_text
-    )
-
-    keyword_detection = (
-        has_patching
-        and
-        has_complete
-        and
-        has_restart
-    )
-
-    if keyword_detection:
-
-        results.append({
-            "target": "patching + complete + restart",
-            "score": 0.90,
-            "candidate": all_text,
-            "words": [],
-        })
-
-    if not results:
+    matched_words = [w for r in matches for w in r["words"]]
+    if not matched_words:
         return None
 
-    results.sort(
-        key=lambda result: result["score"],
-        reverse=True
-    )
+    width, height = ocr["image"].width, ocr["image"].height
+    avg_left = sum(w["left"] for w in matched_words) / len(matched_words)
+    avg_top = sum(w["top"] for w in matched_words) / len(matched_words)
+    rel_x = avg_left / max(1, width)
+    rel_y = avg_top / max(1, height)
 
-    return results[0]
+    x_lo, x_hi = PATCH_CENTER_X_RANGE
+    y_lo, y_hi = PATCH_CENTER_Y_RANGE
+    if not (x_lo <= rel_x <= x_hi and y_lo <= rel_y <= y_hi):
+        return None  # text found, but not where the popup actually appears
 
+    score = min(r["score"] for r in matches)
+    candidate = " | ".join(r["candidate"] for r in matches)
+    return {"score": score, "candidate": candidate}
 
-# ============================================================
-# DEBUG SCREENSHOT
-# ============================================================
 
 def save_debug_screenshot(image):
-
     if not DEBUG:
         return
-
     try:
-
-        image.save(
-            DEBUG_SCREENSHOT
-        )
-
+        image.save(DEBUG_SCREENSHOT)
     except Exception as e:
-
-        log(
-            f"[DEBUG] Could not save screenshot: {e}"
-        )
+        log(f"[DEBUG] Could not save screenshot: {e}")
 
 
-# ============================================================
-# CLOSE GAME
-# ============================================================
+# ---------------- CLOSE / LAUNCH GAME ----------------
 
 def close_game():
-
     processes = get_game_processes()
-
     if not processes:
-
-        log(
-            "[WuWa] No game process found."
-        )
-
+        log("[WuWa] No game process found.")
         return
 
-    log(
-        "[WuWa] Closing Wuthering Waves..."
-    )
-
-    # First attempt graceful termination.
+    log("[WuWa] Closing Wuthering Waves...")
     for process in processes:
-
         try:
-
-            log(
-                f"[WuWa] Terminating "
-                f"{process.info['name']} "
-                f"(PID {process.pid})"
-            )
-
+            log(f"[WuWa] Terminating {process.info['name']} (PID {process.pid})")
             process.terminate()
-
-        except (
-            psutil.NoSuchProcess,
-            psutil.AccessDenied
-        ):
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
 
-    # Wait for graceful termination.
     deadline = time.time() + 6
-
     while time.time() < deadline:
-
         if not is_game_running():
-
-            log(
-                "[WuWa] Game closed."
-            )
-
+            log("[WuWa] Game closed.")
             return
-
         time.sleep(0.25)
 
-    # --------------------------------------------------------
-    # Still alive -> force kill.
-    # --------------------------------------------------------
-
-    log(
-        "[WuWa] Game did not close normally."
-    )
-
-    log(
-        "[WuWa] Force closing..."
-    )
-
+    log("[WuWa] Game did not close normally. Force closing...")
     for process in get_game_processes():
-
         try:
-
             process.kill()
-
-        except (
-            psutil.NoSuchProcess,
-            psutil.AccessDenied
-        ):
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
 
-    # Make sure processes disappear.
     deadline = time.time() + 5
-
     while time.time() < deadline:
-
         if not is_game_running():
-
-            log(
-                "[WuWa] Game force-closed."
-            )
-
+            log("[WuWa] Game force-closed.")
             return
-
         time.sleep(0.25)
 
-    log(
-        "[WuWa] WARNING: WuWa process may still be running."
-    )
+    log("[WuWa] WARNING: WuWa process may still be running.")
 
 
-# ============================================================
-# LAUNCH GAME
-# ============================================================
+# ---------------- AUTO-FIND GAME EXE (STEAM) ----------------
+# Fallback for when the hardcoded GAME_EXE path is wrong, missing, or the
+# game got moved/reinstalled to a different Steam library.
 
-def launch_game():
+def find_steam_install_path():
+    keys = [
+        (winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam", "SteamPath"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Valve\Steam", "InstallPath"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Valve\Steam", "InstallPath"),
+    ]
+    for hive, subkey, value_name in keys:
+        try:
+            with winreg.OpenKey(hive, subkey) as key:
+                value, _ = winreg.QueryValueEx(key, value_name)
+                if value and os.path.isdir(value):
+                    return value
+        except OSError:
+            continue
+    return None
 
-    if not os.path.isfile(
-        GAME_EXE
-    ):
 
-        log("")
-        log(
-            "[ERROR] Game executable was not found:"
-        )
+def find_steam_library_folders():
+    steam_path = find_steam_install_path()
+    if not steam_path:
+        return []
 
-        log(
-            f"        {GAME_EXE}"
-        )
-
-        log("")
-        log(
-            "Edit GAME_EXE at the top of WuWa.py."
-        )
-
-        return False
-
-    log(
-        "[WuWa] Launching game..."
-    )
+    libraries = [steam_path]
+    vdf_path = os.path.join(steam_path, "steamapps", "libraryfolders.vdf")
 
     try:
+        with open(vdf_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+        for match in re.finditer(r'"path"\s*"([^"]+)"', content):
+            path = match.group(1).replace("\\\\", "\\")
+            if path not in libraries:
+                libraries.append(path)
+    except Exception:
+        pass
 
+    return libraries
+
+
+def find_game_exe_auto():
+    """Scan every Steam library for the WuWa install folder."""
+    exe_names = ["Wuthering Waves.exe", "Client-Win64-Shipping.exe"]
+
+    for library in find_steam_library_folders():
+        base = os.path.join(library, "steamapps", "common", "Wuthering Waves")
+        for name in exe_names:
+            candidate = os.path.join(base, name)
+            if os.path.isfile(candidate):
+                return candidate
+
+    return None
+
+
+def launch_game():
+    if not os.path.isfile(GAME_EXE):
+        log(f"\n[ERROR] Game executable was not found:\n        {GAME_EXE}")
+        log("\nEdit GAME_EXE at the top of WuWa.py.")
+        return False
+
+    log("[WuWa] Launching game...")
+    try:
         subprocess.Popen(
-            [GAME_EXE],
-            cwd=os.path.dirname(
-                GAME_EXE
-            ),
-            creationflags=(
-                subprocess.CREATE_NEW_PROCESS_GROUP
-            )
+            [GAME_EXE], cwd=os.path.dirname(GAME_EXE),
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
         )
-
         return True
-
     except Exception as e:
-
-        log(
-            f"[WuWa] Launch error: {e}"
-        )
-
+        log(f"[WuWa] Launch error: {e}")
         return False
 
 
-# ============================================================
-# WAIT FOR PROCESS
-# ============================================================
-
 def wait_for_game_process():
-
-    log(
-        "[WuWa] Waiting for game process..."
-    )
-
+    log("[WuWa] Waiting for game process...")
     while not is_game_running():
-
         time.sleep(1)
+    log("[WuWa] Game process detected.")
 
-    log(
-        "[WuWa] Game process detected."
-    )
-
-
-# ============================================================
-# WAIT FOR WINDOW
-# ============================================================
 
 def wait_for_window_after_launch():
-
-    # First wait for process.
     wait_for_game_process()
+    return wait_for_game_window(timeout=120)
 
-    # Then wait for actual graphical window.
-    window = wait_for_game_window(
-        timeout=120
-    )
-
-    return window
-
-
-# ============================================================
-# RESTART COUNTDOWN
-# ============================================================
 
 def restart_countdown():
-
-    log("")
-    log(
-        f"[WuWa] Waiting "
-        f"{RESTART_WAIT_SECONDS} seconds "
-        f"before restarting..."
-    )
-
-    for remaining in range(
-        RESTART_WAIT_SECONDS,
-        0,
-        -1
-    ):
-
-        print(
-            f"\r[WuWa] Restarting in "
-            f"{remaining:3d} seconds...",
-            end="",
-            flush=True
-        )
-
+    log(f"\n[WuWa] Waiting {RESTART_WAIT_SECONDS} seconds before restarting...")
+    for remaining in range(RESTART_WAIT_SECONDS, 0, -1):
+        print(f"\r[WuWa] Restarting in {remaining:3d} seconds...", end="", flush=True)
         time.sleep(1)
-
     print()
 
 
-# ============================================================
-# MAIN OCR LOOP
-# ============================================================
+# ---------------- MAIN OCR LOOP ----------------
 
 def monitor_game():
-
     login_count = 0
     patch_count = 0
+    scan_number = 0
 
-    last_logged_ocr = ""
-
-    with mss.mss() as sct:
-
-        while True:
-
-            # ------------------------------------------------
-            # Find current WuWa window.
-            #
-            # We do this repeatedly because after a restart
-            # the window handle can change.
-            # ------------------------------------------------
-
-            window = find_best_game_window()
-
+    while True:
+        # Re-find the window each loop since restarts change the HWND.
+        window = find_best_game_window()
+        if not window:
+            if not is_game_running():
+                log("[WuWa] Game process disappeared. Waiting for it to return...")
+                wait_for_game_process()
+            window = wait_for_game_window(timeout=30)
             if not window:
-
-                if not is_game_running():
-
-                    log(
-                        "[WuWa] Game process disappeared."
-                    )
-
-                    log(
-                        "[WuWa] Waiting for it to return..."
-                    )
-
-                    wait_for_game_process()
-
-                window = wait_for_game_window(
-                    timeout=30
-                )
-
-                if not window:
-
-                    time.sleep(1)
-                    continue
-
-            # ------------------------------------------------
-            # Capture entire game window.
-            # ------------------------------------------------
-
-            image = capture_game_window(
-                sct,
-                window
-            )
-
-            if image is None:
-
                 time.sleep(1)
                 continue
 
-            # ------------------------------------------------
-            # OCR entire game window.
-            # ------------------------------------------------
-
-            ocr = perform_ocr(
-                image
-            )
-
-            text = ocr["text"]
-
-            # ------------------------------------------------
-            # DEBUG
-            # ------------------------------------------------
-
-            if DEBUG:
-
-                # Don't spam identical OCR results.
-                if text != last_logged_ocr:
-
-                    log(
-                        f"[OCR] {text}"
-                    )
-
-                    last_logged_ocr = text
-
-            # ------------------------------------------------
-            # Detect login.
-            # ------------------------------------------------
-
-            login = detect_login(
-                ocr
-            )
-
-            # ------------------------------------------------
-            # Detect patch restart.
-            # ------------------------------------------------
-
-            patch = detect_patch(
-                ocr
-            )
-
-            # =================================================
-            # LOGIN
-            # =================================================
-
-            if login:
-
-                login_count += 1
-
-                log(
-                    f"[LOGIN] Possible detection "
-                    f"{login_count}/"
-                    f"{LOGIN_CONFIRMATIONS_REQUIRED} "
-                    f"| score={login['score']:.2f} "
-                    f"| text='{login['candidate']}'"
-                )
-
-            else:
-
-                login_count = 0
-
-            # =================================================
-            # PATCH
-            # =================================================
-
-            if patch:
-
-                patch_count += 1
-
-                log(
-                    f"[PATCH] Possible detection "
-                    f"{patch_count}/"
-                    f"{PATCH_CONFIRMATIONS_REQUIRED} "
-                    f"| score={patch['score']:.2f} "
-                    f"| text='{patch['candidate']}'"
-                )
-
-            else:
-
-                patch_count = 0
-
-            # =================================================
-            # LOGIN CONFIRMED
-            # =================================================
-
-            if (
-                login_count
-                >=
-                LOGIN_CONFIRMATIONS_REQUIRED
-            ):
-
-                log("")
-                log("=" * 60)
-                log(
-                    "[SUCCESS] LOGIN SCREEN CONFIRMED"
-                )
-                log("=" * 60)
-                log("")
-                log(
-                    "Detected:"
-                )
-                log(
-                    f"    {login['candidate']}"
-                )
-                log("")
-                log(
-                    "Wuthering Waves will remain running."
-                )
-                log(
-                    "The watchdog is exiting."
-                )
-                log("")
-
-                return
-
-            # =================================================
-            # PATCH CONFIRMED
-            # =================================================
-
-            if (
-                patch_count
-                >=
-                PATCH_CONFIRMATIONS_REQUIRED
-            ):
-
-                log("")
-                log("=" * 60)
-                log(
-                    "[PATCH] RESTART MESSAGE CONFIRMED"
-                )
-                log("=" * 60)
-                log("")
-                log(
-                    f"Detected: {patch['candidate']}"
-                )
-                log("")
-
-                # Reset counters.
-                login_count = 0
-                patch_count = 0
-
-                # Close WuWa.
-                close_game()
-
-                # Wait.
-                restart_countdown()
-
-                # Launch again.
-                if launch_game():
-
-                    log(
-                        "[WuWa] Restart launched."
-                    )
-
-                    # Wait until new game window appears.
-                    new_window = (
-                        wait_for_window_after_launch()
-                    )
-
-                    if new_window:
-
-                        log(
-                            "[WuWa] New game window detected."
-                        )
-
-                    else:
-
-                        log(
-                            "[WuWa] WARNING: "
-                            "Game window was not found yet."
-                        )
-
-                else:
-
-                    log(
-                        "[WuWa] Restart failed."
-                    )
-
-                    return
-
-                continue
-
-            # ------------------------------------------------
-            # Wait before next OCR scan.
-            # ------------------------------------------------
-
-            time.sleep(
-                CHECK_INTERVAL_SECONDS
-            )
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
-
-    print()
-    print("=" * 60)
-    print("       WUTHERING WAVES OCR WATCHDOG")
-    print("=" * 60)
-    print()
-
-    # --------------------------------------------------------
-    # Check Tesseract.
-    # --------------------------------------------------------
-
-    if not os.path.isfile(
-        TESSERACT_PATH
-    ):
-
-        print(
-            "[ERROR] Tesseract was not found:"
-        )
-
-        print(
-            TESSERACT_PATH
-        )
-
-        print()
-        print(
-            "Change TESSERACT_PATH at the top of WuWa.py."
-        )
-
-        input(
-            "\nPress Enter to exit..."
-        )
-
-        return
-
-    log(
-        "[SYSTEM] Tesseract found."
-    )
-
-    # --------------------------------------------------------
-    # Check game executable.
-    # --------------------------------------------------------
-
-    if not os.path.isfile(
-        GAME_EXE
-    ):
-
-        print()
-        print(
-            "[ERROR] Wuthering Waves executable not found:"
-        )
-
-        print(
-            GAME_EXE
-        )
-
-        print()
-        print(
-            "Edit GAME_EXE at the top of WuWa.py."
-        )
-
-        input(
-            "\nPress Enter to exit..."
-        )
-
-        return
-
-    log(
-        "[SYSTEM] Game executable found."
-    )
-
-    # --------------------------------------------------------
-    # Clear old log.
-    # --------------------------------------------------------
-
-    try:
-
-        LOG_FILE.unlink()
-
-    except FileNotFoundError:
-
-        pass
-
-    # --------------------------------------------------------
-    # Start game if necessary.
-    # --------------------------------------------------------
-
-    if is_game_running():
-
-        log(
-            "[WuWa] Game is already running."
-        )
-
-    else:
-
-        if not launch_game():
-
-            input(
-                "\nPress Enter to exit..."
-            )
-
+        image = capture_game_window(window)
+        if image is None:
+            time.sleep(1)
+            continue
+
+        scan_number += 1
+        if DEBUG and scan_number % DEBUG_SCREENSHOT_EVERY_N == 0:
+            save_debug_screenshot(image)
+
+        ocr = perform_ocr(image)
+
+        if DEBUG:
+            log("\n[DEBUG] OCR WORDS:")
+            for word in ocr["words"]:
+                log(f"    '{word['text']}' conf={word['confidence']:.1f} "
+                    f"x={word['left']} y={word['top']} w={word['width']} h={word['height']}")
+            log("")
+
+        login = detect_login(ocr)
+        patch = detect_patch(ocr)
+
+        if login:
+            login_count += 1
+            log(f"[LOGIN] Possible detection {login_count}/{LOGIN_CONFIRMATIONS_REQUIRED} "
+                f"| score={login['score']:.2f} | text='{login['candidate']}'")
+        else:
+            login_count = 0
+
+        if patch:
+            patch_count += 1
+            log(f"[PATCH] Possible detection {patch_count}/{PATCH_CONFIRMATIONS_REQUIRED} "
+                f"| score={patch['score']:.2f} | text='{patch['candidate']}'")
+        else:
+            patch_count = 0
+
+        if login_count >= LOGIN_CONFIRMATIONS_REQUIRED:
+            log("\n" + "=" * 60)
+            log("[SUCCESS] LOGIN SCREEN CONFIRMED")
+            log("=" * 60)
+            log(f"\nDetected:\n    {login['candidate']}\n")
+            log("Wuthering Waves will remain running.")
+            log("The watchdog is exiting.\n")
             return
 
-    # --------------------------------------------------------
-    # Wait for graphical window.
-    # --------------------------------------------------------
+        if patch_count >= PATCH_CONFIRMATIONS_REQUIRED:
+            log("\n" + "=" * 60)
+            log("[PATCH] RESTART MESSAGE CONFIRMED")
+            log("=" * 60)
+            log(f"\nDetected: {patch['candidate']}\n")
 
-    window = wait_for_window_after_launch()
+            login_count = 0
+            patch_count = 0
 
-    if not window:
+            close_game()
+            restart_countdown()
 
-        log("")
-        log(
-            "[ERROR] Could not find WuWa window."
+            if launch_game():
+                log("[WuWa] Restart launched.")
+                new_window = wait_for_window_after_launch()
+                log("[WuWa] New game window detected." if new_window
+                    else "[WuWa] WARNING: Game window was not found yet.")
+            else:
+                log("[WuWa] Restart failed.")
+                return
+
+            continue
+
+        time.sleep(CHECK_INTERVAL_SECONDS)
+
+
+# ---------------- MAIN ----------------
+
+# ---------------- TESSERACT CHECK ----------------
+
+def ensure_tesseract_installed():
+    """
+    If Tesseract isn't found, pop up a small dialog offering to open the
+    download page. Tesseract is a real .exe, not a pip package, so this
+    can't auto-install it -- just point the user at the installer.
+    """
+    if os.path.isfile(TESSERACT_PATH):
+        return True
+
+    root = tk.Tk()
+    root.withdraw()
+
+    while not os.path.isfile(TESSERACT_PATH):
+        wants_download = messagebox.askyesno(
+            "Tesseract-OCR Not Found",
+            "This script needs Tesseract-OCR, which isn't installed "
+            f"at:\n\n{TESSERACT_PATH}\n\n"
+            "Open the download page now?",
         )
 
-        log(
-            "The game may still be starting."
+        if not wants_download:
+            root.destroy()
+            return False
+
+        webbrowser.open(TESSERACT_DOWNLOAD_URL)
+
+        keep_waiting = messagebox.askokcancel(
+            "Waiting for Install",
+            "Install Tesseract-OCR (default install path recommended), "
+            "then click OK to continue.\n\n"
+            "Click Cancel to give up and exit.",
         )
 
-        input(
-            "\nPress Enter to exit..."
-        )
+        if not keep_waiting:
+            root.destroy()
+            return False
 
+    root.destroy()
+    return True
+
+
+def main():
+    print("\n" + "=" * 60)
+    print("       WUTHERING WAVES OCR WATCHDOG")
+    print("=" * 60 + "\n")
+
+    # Must run before any log() call: log() now keeps the file open for
+    # the whole session, and Windows can't delete a file that's open.
+    try:
+        LOG_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
+    if not ensure_tesseract_installed():
+        print("[ERROR] Tesseract-OCR is required. Exiting.")
+        input("\nPress Enter to exit...")
+        return
+    log("[SYSTEM] Tesseract found.")
+
+    global GAME_EXE
+    if not os.path.isfile(GAME_EXE):
+        auto_path = find_game_exe_auto()
+        if auto_path:
+            log(f"[SYSTEM] Configured GAME_EXE not found, auto-detected via Steam: {auto_path}")
+            GAME_EXE = auto_path
+        else:
+            print(f"\n[ERROR] Wuthering Waves executable not found:\n{GAME_EXE}")
+            print("\nCould not auto-detect it via Steam either.")
+            print("Edit GAME_EXE at the top of WuWa.py.")
+            input("\nPress Enter to exit...")
+            return
+    log("[SYSTEM] Game executable found.")
+
+    if is_game_running():
+        log("[WuWa] Game is already running.")
+    elif not launch_game():
+        input("\nPress Enter to exit...")
         return
 
-    # --------------------------------------------------------
-    # Start monitor.
-    # --------------------------------------------------------
+    window = wait_for_window_after_launch()
+    if not window:
+        log("\n[ERROR] Could not find WuWa window.")
+        log("The game may still be starting.")
+        input("\nPress Enter to exit...")
+        return
 
-    log("")
+    log("\n" + "=" * 60)
+    log("[OCR] MONITORING STARTED")
     log("=" * 60)
-    log(
-        "[OCR] MONITORING STARTED"
-    )
-    log("=" * 60)
-    log("")
-    log(
-        "[OCR] Looking for:"
-    )
-    log(
-        f"       LOGIN  = {LOGIN_TARGET}"
-    )
-    log(
-        "       PATCH  = Patching complete / Please restart"
-    )
-    log("")
-    log(
-        "[OCR] Entire WuWa window is scanned."
-    )
-    log(
-        "[OCR] Screen resolution does not need to be configured."
-    )
-    log("")
-    log(
-        "[OCR] Press Ctrl+C to stop."
-    )
-    log("")
-
-    # --------------------------------------------------------
-    # Monitor.
-    # --------------------------------------------------------
+    log("\n[OCR] Looking for:")
+    log(f"       LOGIN  = {LOGIN_TARGET}")
+    log("       PATCH  = Patching complete / Please restart")
+    log("\n[OCR] Entire WuWa window is scanned.")
+    log("[OCR] Screen resolution does not need to be configured.")
+    log("\n[OCR] Press Ctrl+C to stop.\n")
 
     try:
-
         monitor_game()
-
     except KeyboardInterrupt:
-
-        print()
-        print()
-        log(
-            "[SYSTEM] Watchdog stopped by user."
-        )
-
+        print("\n")
+        log("[SYSTEM] Watchdog stopped by user.")
     except Exception as e:
+        log(f"\n[FATAL ERROR] {e}")
+        log("The game has NOT been intentionally closed.")
 
-        log("")
-        log(
-            f"[FATAL ERROR] {e}"
-        )
-
-        log(
-            "The game has NOT been intentionally closed."
-        )
-
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
 
 if __name__ == "__main__":
     main()
