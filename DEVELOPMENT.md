@@ -7,10 +7,12 @@ If you just want to use the app, see [Readme](README.md) instead.
 
 - [Requirements](#requirements)
 - [Setup](#setup)
+- [Project Structure](#project-structure)
 - [Running From Source](#running-from-source)
 - [Configuration](#configuration)
 - [Testing the Fallback Flows](#testing-the-fallback-flows)
 - [Building the .exe](#building-the-exe)
+- [Packaging a Release](#packaging-a-release)
 - [Where Data Is Stored](#where-data-is-stored)
 - [Important Considerations](#important-considerations)
 
@@ -20,6 +22,7 @@ If you just want to use the app, see [Readme](README.md) instead.
 - Python 3.13+
 - Tesseract-OCR (or let the script prompt you for it on first run)
 - Git (to clone the repo)
+- PyInstaller and 7-Zip (only needed to build/package releases)
 
 ## Setup
 
@@ -35,6 +38,34 @@ them yourself up front:
 
 ```bash
 python -m pip install -r requirements.txt
+```
+
+## Project Structure
+
+```
+WuWa-AutoPatchReboot/
+├── wuwa-apr.py          # the entire application, single file
+├── requirements.txt     # runtime deps (also auto-installed on first run)
+├── icon.png             # tray icon, bundled into the exe via --add-data
+├── wuwa.ico             # exe file/taskbar icon, used via --icon
+├── README.md            # end-user docs
+├── DEVELOPMENT.md       # this file
+├── LICENSE
+└── .gitignore
+```
+
+Both `icon.png` and `wuwa.ico` are source assets, not build output, and
+are tracked in git. Build output (`build/`, `dist/`, `*.spec`) and
+anything generated at runtime is gitignored.
+
+After a build you'll also have:
+
+```
+build/                   # PyInstaller scratch, safe to delete
+dist/
+└── wuwa-apr/            # <- the actual releasable app
+    ├── wuwa-apr.exe
+    └── _internal/
 ```
 
 ## Running From Source
@@ -109,17 +140,42 @@ touched.
 ## Building the .exe
 
 ```powershell
-pyinstaller --onefile --windowed --icon=wuwa.ico --uac-admin --add-data "icon.png;." wuwa-apr.py
+pyinstaller --onedir --windowed --icon=wuwa.ico --add-data "icon.png;." wuwa-apr.py
 ```
 
+- `--onedir` produces an exe plus an `_internal\` folder, rather than a
+  single self-extracting exe. See the note below on why.
 - `--windowed` suppresses the console window (the app is tray/dialog-driven).
 - `--icon=wuwa.ico` sets the exe's file/taskbar icon.
-- `--uac-admin` embeds a manifest so Windows handles the elevation prompt
-  natively, before the exe even starts.
 - `--add-data "icon.png;."` bundles the tray icon image so it's available
-  at runtime via the frozen exe's temp extraction folder.
+  at runtime.
 
-The built exe will be in `dist/`.
+Output lands in `dist\wuwa-apr\`.
+
+**Why `--onedir` and not `--onefile`:** a one-file build extracts itself
+to a temporary `_MEIxxxxx` folder under `%TEMP%` on every launch and
+deletes it on exit. That delete can fail if anything briefly holds a file
+handle in there, producing a "Failed to remove temporary directory"
+warning dialog in the user's face. `--onedir` has no extraction step at
+all, so that failure mode simply doesn't exist.
+
+**Why no `--uac-admin`:** the script elevates itself at startup via
+`ShellExecuteW(..., "runas", ...)` (see the `is_admin()` block near the
+top of `wuwa-apr.py`). A `requireAdministrator` manifest would mean any
+parent process launching the exe with a plain `CreateProcess` fails
+outright with error 740, which breaks launching from other programs.
+Self-elevation works regardless of how the exe was started.
+
+## Packaging a Release
+
+Zip up the built folder and attach the archive to a GitHub Release:
+
+```powershell
+7z a WuWa-AutoPatchReboot-v1.0.0.7z .\dist\wuwa-apr\*
+```
+
+Users extract it and run `wuwa-apr.exe`. Keep `_internal\` alongside the
+exe, the app won't start without it.
 
 ## Where Data Is Stored
 
@@ -143,6 +199,7 @@ rebuilt.
   separately, which `ensure_dependencies()` now handles automatically by
   running `pywin32_postinstall.py -install` when needed. If you ever hit
   this manually, run:
+  
   ```powershell
   python Scripts\pywin32_postinstall.py -install
   ```
@@ -155,3 +212,7 @@ rebuilt.
   pywin32 isn't fully working (see above) on the machine doing the build,
   the build itself will fail with the same error, even though end users
   of the resulting exe would never see it.
+- **`cleanup_stale_pyinstaller_temp_dirs()` is a leftover safety net.**
+  It sweeps old `_MEI*` folders out of `%TEMP%` at startup, which only
+  ever mattered for `--onefile` builds. It's a no-op under `--onedir`,
+  kept in case the build mode ever changes back.
